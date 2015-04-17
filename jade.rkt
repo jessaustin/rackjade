@@ -11,15 +11,6 @@
   (λ (chars)
     (return (wrap (list->string chars)))))
 
-;; parsers
-(define text
-  (>>= (many1Until $anyChar
-                   (lookAhead (<or> (string "#[")
-                                    (string "#{")
-                                    (string "!{")
-                                    $eol)))
-       (returnString)))
-
 ; XXX this is quite incomplete
 ; it should include code exec
 (define rightSide
@@ -27,6 +18,15 @@
            (char #\")
            (>>= (many (noneOf "\""))
                 (returnString))))
+
+;; text parsers
+(define text
+  (>>= (many1Until $anyChar
+                   (lookAhead (<or> (string "#[")
+                                    (string "#{")
+                                    (string "!{")
+                                    $eol)))
+       (returnString)))
 
 (define escapedInterpolation
   (between (string "#{")
@@ -56,7 +56,18 @@
       (>> (string "| ")
           textLine)))
 
-(define tag
+(define textBlock
+  (parser-compose (indent <- (>>= (lookAhead (many $space))
+                                  (returnString)))
+                  (lines  <- (>>= (many (>> (string indent)
+                                            textLine))
+                                  (λ (lines)
+                                    (return (map car
+                                                 lines)))))
+                  (return (string-join lines))))
+
+;; node parsers
+(define tagName
   (>>= (many1 $alphaNum)
        (returnString string->symbol)))
 
@@ -104,44 +115,41 @@
                         literals)))))
 
 (define divLiteral
-  (>>= literals
+  (>>= (parser-seq literals
+                   attributes)
        (λ (attributes)
-         (return (list 'div attributes)))))
+         (return (list 'div
+                       (apply append
+                              attributes))))))
 
-(define tagAndAttributes
-  (parser-compose (ta <- (<or> divLiteral
-                               (parser-seq tag
-                                           (maybe literals))))
-                  (a2 <- (maybe attributes))
-                  (return
-                    (let*-values ([(tag) (car ta)]
-                                  [(attrs) (append (cadr ta) a2)]
-                                  [(class rest) (partition (λ (item)
-                                                             (equal? (car item)
-                                                                     'class))
-                                                           attrs)]
-                                  [(classes) (map second class)])
-                      (list tag
-                            (append rest
-                                    (if (null? classes)
-                                        null
-                                        (list (list 'class
-                                                    (string-join classes))))))))))
-
-(define textBlock
-  (parser-compose (indent <- (>>= (lookAhead (many $space))
-                                  (returnString)))
-                  (lines  <- (>>= (many (>> (string indent)
-                                            textLine))
-                                  (λ (lines)
-                                    (return (map car
-                                                 lines)))))
-                  (return (string-join lines))))
+(define tag
+  (>>= (<or> divLiteral
+             (parser-compose (t  <- tagName)
+                             (a1 <- (maybe literals))
+                             (a2 <- (maybe attributes))
+                             (return (list t
+                                           (append a1
+                                                   a2)))))
+       ; more complicated than we'd like, since list-no-order can't use
+       ; multiple ...
+       (match-lambda [(list tag attrs)
+                      (let*-values ([(class rest)
+                                     (partition (λ (item)
+                                                  (equal? (car item)
+                                                          'class))
+                                                attrs)]
+                                    [(classes) (map second class)])
+                        (return (list tag
+                                      (append rest
+                                              (if (null? classes)
+                                                  null
+                                                  (list (list 'class
+                                                              (string-join classes))))))))])))
 
 (define element
   (parser-compose (indent <- (>>= (many $space)
                                   (returnString)))
-                  (tagAtt <- tagAndAttributes)
+                  (tagAtt <- tag)
                   (chldrn <- (maybe (<or> (parser-seq (maybe (>> $space
                                                                  textLine))
                                                       (~ $eol)
@@ -163,10 +171,10 @@
 ;(parse attributes "(baz=\"bak\")")
 ;(parse attributes "(baz=\"bak\", foo=\"bar\"  gee)")
 ;(parse divLiteral ".foo#gomp.bar")
-;(parse tagAndAttributes ".foo.gomp.bar(zap=\"ban\", goff=\"goo\" spoo)")
-;(parse tagAndAttributes ".foo#gomp.bar(zap=\"ban\" goff=\"goo\", spoo)")
-;(parse tagAndAttributes "p.foo#gomp.bar(zap=\"ban\", goff=\"goo\" spoo)")
-;(parse tagAndAttributes "foo")
+;(parse tag ".foo.gomp.bar(zap=\"ban\", goff=\"goo\" spoo)")
+;(parse tag ".foo#gomp.bar(zap=\"ban\" goff=\"goo\", spoo)")
+;(parse tag "p.foo#gomp.bar(zap=\"ban\", goff=\"goo\" spoo)")
+;(parse tag "foo")
 ;(parse divLiteral ".foo.bar")
 ;(parse divLiteral "#gomp.bar")
 ;(parse divLiteral ".foo#gomp")
