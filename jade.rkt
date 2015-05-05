@@ -1,14 +1,43 @@
 #lang racket
 
 (require parsack)
+(require xml)
 
 ;; convenience procs
+
+; this one is useful enough to be included in parsack; "p" is a parser
 (define (maybe p [else null])
   (<or> (try p)
         (return else)))
 
+; because $spaces includes #\newline, which we never want
+(define justSpaces
+  (many (char #\space)))
+
+; parsack produces lots of lists of chars
 (define (returnString [transform identity])
-  (compose return transform list->string))
+  (compose return
+           transform
+           list->string))
+
+; This seems excessive, but see
+; www.owasp.org/index.php/XSS_(Cross_Site_Scripting)_Prevention_Cheat_Sheet
+; This covers rules 1 & 2. Maybe we should also cover rule 3, but probably you
+; just shouldn't put user-supplied data into js expressions.
+(define escape
+  (compose string-append*
+           (curry map
+                  (λ (chr)
+                    (if (or (char<=? #\Ā chr)  ; >= 256
+                            (char-alphabetic? chr)
+                            (char-numeric? chr))
+                        (make-string 1 chr)
+                        (string-append "&#x"
+                                       (~r (char->integer chr)
+                                           #:min-width 2
+                                           #:pad-string "0"
+                                           #:base 16)))))
+           string->list))
 
 ; XXX this is quite incomplete
 ; it should include code exec
@@ -21,37 +50,44 @@
 ;; text parsers
 (define text
   (>>= (many1Until $anyChar
-                   (lookAhead (<or> (string "#[")
-                                    (string "#{")
-                                    (string "!{")
-                                    $eol)))
-       (returnString)))
+                   (lookAhead (<or> (try (string "#["))
+                                    (try (string "#{"))
+                                    (try (string "!{"))
+                                    $eol
+                                    $eof)))
+       (returnString string-trim)))
 
 (define escapedInterpolation
   (between (string "#{")
            (char #\})
            rightSide)) ; XXX escape this!
 
-(define unescapedInterpolation
+(define unEscapedInterpolation
   (between (string "!{")
            (char #\})
            rightSide))
 
-(define tagInterpolation ; XXX prevent element from eating the "]"
+
+(define tagInterpolation
   (between (string "#[")
            (char #\])
-           (λ (state)  ; element isn't defined yet so wrap in λ
-             (element state))))
+           (>>= (many (<!> (char #\])))
+;                (returnString (compose parse-result (node null))))))
+                (λ (state)
+                  (return (parse-result (node null)
+                                        (list->string state)))))))
 
 (define textLine
-  (many1Until (<or> (try escapedInterpolation)
-                    unescapedInterpolation
-                    tagInterpolation
-                    text)
-              (lookAhead $eol)))
+  (>> justSpaces
+      (many1Until (<or> (try escapedInterpolation)
+                        unEscapedInterpolation
+                        tagInterpolation
+                        text)
+                  (<or> $eol
+                        $eof))))
 
-(define pipedText
-  (>> $spaces
+(define pipeText
+  (>> justSpaces
       (>> (string "| ")
           (>>= textLine
                (compose return first)))))
@@ -60,9 +96,15 @@
 (define tagName
   (maybe (>>= (many1 $alphaNum)
               (returnString string->symbol))
-         'div))
+         'div))  ; clever!
 
-(define attribute
+; Attributes have a name and a value. Attribute names must consist of one or more characters other than the space characters,
+; U+0000 NULL, U+0022 QUOTATION MARK ("), U+0027 APOSTROPHE ('), ">" (U+003E), "/" (U+002F), and "=" (U+003D) characters, the
+; control characters, and any characters that are not defined by Unicode. In the HTML syntax, attribute names, even those for
+; foreign elements, may be written with any mix of lower- and uppercase letters that are an ASCII case-insensitive match for
+; the attribute's name.
+
+(define attr
   (parser-compose
     (attr <- (>>= (many1 $alphaNum)
                   (returnString string->symbol)))
@@ -75,8 +117,8 @@
 (define attributes
   (between (char #\()
            (char #\))
-           (sepBy1 attribute
-                   (many (<or> $space
+           (sepBy1 attr
+                   (many (<or> (char #\space)
                                (char #\,))))))
 
 (define andAttributes
@@ -90,16 +132,11 @@
        (returnString (curry list 'id))))
 
 (define classLiteral
-  (>> (try (lookAhead (>> (char #\.)
+  (>> (try (lookAhead (>> (char #\.)   ; ensure we're not starting a text block
                           $alphaNum)))
       (>>= (>> (char #\.)
                (many1 $alphaNum))
            (returnString (curry list 'class)))))
-
-(define (leaveNull item transform)
-  (if (null? item)
-      item
-      (transform item)))
 
 (define tag
   (parser-compose
@@ -111,66 +148,191 @@
     (a2 <- (maybe andAttributes))
     (return
       (let*-values ([(attrs) (append a1 a2)]
-                    [(clattrs rest) (partition (compose (curry equal? 'class)
-                                                        first)
-                                               attrs)]
-                    [(classes) (map second (append c1 c2 clattrs))])
+                    [(cA etc) (partition (compose (curry equal? 'class)
+                                                  first)
+                                         attrs)]
+                    [(classes) (map second (append c1 c2 cA))])
         (list tn
-              (append (leaveNull id
-                                 list)
-                      (leaveNull classes
-                                 (compose list
-                                          (curry list 'class)
-                                          string-join))
-                      rest))))))
+              (append (if (null? id)
+                          id
+                          (list id))
+                      (if (null? classes)
+                          classes
+                          (list (list 'class
+                                      (string-join classes))))
+                      etc))))))
 
-(define (indentAtLeast spaces p)
-  (>> (try (lookAhead (>> $eol
-                          (>> (string (list->string spaces))
-                              (many1 $space)))))
-      (>> $eol
-          p)))
+(define buffered rightSide)
+(define unEscaped rightSide)
 
-(define element
+; special: mixin
+;          case when default
+;          if else if else unless
+;          extends block (append prepend)
+;          include
+;          each (v, i) in (list)
+;          while (t/f) 
+; //
+; -
+; =
+; !=
+
+(define (indentAtLeast spaces)
+  (try (lookAhead (>> (string (list->string spaces))
+                      (many1 $space)))))
+
+(define (children indent)
+  (<or> (>> (string ": ")                        ; inline element is only child
+            (>>= (_element indent)
+                 (compose return
+                          list)))
+        (>>= (<or> (>> (char #\.)                ; text block is only child
+                       (>> $eol
+                           (many (>> (indentAtLeast indent)
+                                     textLine))))
+                   (parser-seq (<or> (>> (char #\space)
+                                         textLine)
+                                     (>> $eol
+                                         (return null))
+                                     $eof)
+                               (many (>> (indentAtLeast indent)
+                                         (_element)))))
+             (compose return
+                      collapseStrings))))
+
+; if consecutive items in lists are strings, combine them into one string
+(define collapseStrings
+  (compose (curry foldr
+                  (match-lambda**
+                    [((? string? a)
+                      (cons (? string? b) z))
+                     (cons (string-join (list a b)) z)]
+                    [(a z) (cons a z)])
+                  null)
+           append*))
+
+
+(define (unBufferedComment indent)
+  (>> (string "//-")
+      (>> (children indent)
+          (return null))))
+
+(define (_comment indent)
+  (>> (string "//")
+      (>>= (parser-cons (<or> textLine
+                              (>> $eol
+                                  (return null)))
+                        (many (>> (indentAtLeast indent)
+                                  textLine)))
+           (compose return
+                    make-comment
+                    car
+                    collapseStrings))))
+
+(define (node indent)
   (parser-compose
-    (indent <- (many (char #\space)))
     (tagAtt <- tag)
-    (chldrn <- (<or> (>> (char #\.)
-                         (many (indentAtLeast indent
-                                              (>> $spaces
-                                                  textLine))))
-                     (>>= (parser-seq
-                            (maybe (>> (char #\space)
-                                       textLine))
-                            (many (indentAtLeast indent
-                                                 (<or> (try pipedText)
-                                                       element))))
-                          (compose return (curry apply append)))))
+    (chldrn <- (children indent))
     (return (append tagAtt
                     chldrn))))
 
-;(parse textLine "this is text, #[bar], and more text.\n")
-;(parse tagInterpolation "#[baz]")
-;(parse attribute "baz=\"bak\"")
-;(parse attribute "baz")
-;(parse attributes "(baz)")
-;(parse attributes "(baz=\"bak\")")
-;(parse attributes "(baz=\"bak\", foo=\"bar\"  gee)")
-;(parse divLiteral ".foo#gomp.bar")
-;(parse tag ".foo.gomp.bar(zap=\"ban\", goff=\"goo\" spoo)")
-;(parse tag ".foo#gomp.bar(zap=\"ban\" goff=\"goo\", spoo)")
-;(parse tag "p.foo#gomp.bar(zap=\"ban\", goff=\"goo\" spoo)")
-;(parse tag "foo")
-;(parse divLiteral ".foo.bar")
-;(parse divLiteral "#gomp.bar")
-;(parse divLiteral ".foo#gomp")
-;element
-;(parse element "p")
-;(parse element "p(baz=\"bak\" foo=\"bar\") abc def ghi\n")
-;(parse element ".bax#goo.bar abc def ghi\n")
-;(parse element "p(baz=\"bak\") abc #[foo] def #[bar] ghi\n")
-;(parse textLine "abc #[foo] def #[bar.gee] ghi\n")
-(parse element ".po#goo.kob(baz=\"bak\",\n nab=\"ban\" class=\"extra\") abc #[foo] def #[bar.gee] ghi\n")
-(parse element "p This is text.\n  | This is more.\n  span#here More\n  | text.\n")
-(parse element "p.\n  This is more.\n  Now #[span#here more] text.\n")
-;(parse textBlock "  This is text.\n")
+(define conditional
+  (parser-compose
+    (indent <- justSpaces)
+    (string "if")
+    (many1 $space)
+    (cond <- (parser-seq rightSide
+                         children))
+    (conds <- (many (>> (string "else if")
+                        (>> (many1 $space)
+                            (parser-seq rightSide
+                                        children)))))
+    (else <- (maybe (>> (string "else")
+                        (>> (many1 $space)
+                            (parser-seq rightSide
+                                        children)))))
+    (return (cadr (assf identity
+                        (cons cond
+                              (append conds
+                                      else)))))))
+
+(define case
+  (parser-compose
+    (indent <- justSpaces)
+    (string "case")
+    (many1 $space)
+    (var <- rightSide)
+    (many1 $space)
+    (cases <- (many (parser-seq (~ (indentAtLeast indent))
+                                (~ (string "when"))
+                                (~ (many1 $space))
+                                (>>= rightSide
+                                     (compose return
+                                              (curry equal? var)))
+                                children)))
+    (default <- (maybe (>> (indentAtLeast indent)
+                           (>> (string "default")
+                               (>> (many1 $space)
+                                   (>>= children
+                                        (compose return
+                                                 (curry list #t))))))))
+    (return (cadr (assf identity
+                        (append cases
+                                default))))))
+
+;(define each
+ ; (parser-compose
+  ;  (indent <- justSpaces)
+   ; (<or> (string "each")
+    ;      (string "for"))
+;    (many1 $space)
+ ;   (lst <- rightSide)
+  ;  (return (map ()
+   ;              lst))))
+
+;(define while
+ ;   (parser-compose
+  ;  (indent <- justSpaces)
+   ; (string "while")
+    ;(many1 $space)
+    ;( <- rightSide)
+
+; indent is passed in when element is on the same line with its parent and ":"
+; otherwise justSpaces figures it out
+(define (_element [indent null])
+  (parser-compose
+    (indent <- (if (pair? indent)
+                   (return indent)
+                   justSpaces))
+    (e <- (<or> pipeText               ; pipeText has no children, so no indent
+                (try (unBufferedComment indent))
+                (_comment indent)
+                (node indent)
+                conditional
+                case))
+    (return e)))
+
+(parse (_element)
+"html
+  body
+    p#first.
+      This is an introductory paragraph.
+    #nav.nav
+      ol
+        li: a(href=\"one.html\") One
+        li
+          a(href=\"two.html\") Two
+    #main.content
+      p
+        | Here is some content. Content
+        | is great.
+        span This is a span
+        | and this is text after the span.
+      p.
+        #[i Interesting] content, however, is 
+        often difficult to find.
+      // This is a
+         comment!
+         That goes on and on.
+      p This is a short paragraph.
+      #end")
