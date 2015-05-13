@@ -20,6 +20,17 @@
            transform
            list->string))
 
+; if consecutive items in lists are strings, combine them into one string
+(define collapseStrings
+  (compose (curry foldr
+                  (match-lambda**
+                    [((? string? a)
+                      (cons (? string? b) z))
+                     (cons (string-join (list a b)) z)]
+                    [(a z) (cons a z)])
+                  null)
+           append*))
+
 ; This seems excessive, but see
 ; www.owasp.org/index.php/XSS_(Cross_Site_Scripting)_Prevention_Cheat_Sheet
 ; This covers rules 1 & 2. Maybe we should also cover rule 3, but probably you
@@ -47,15 +58,26 @@
            (>>= (many (noneOf "\""))
                 (returnString))))
 
-;; text parsers
+;; text parsers  XXX clean up
 (define text
-  (>>= (many1Until $anyChar
-                   (lookAhead (<or> (try (string "#["))
-                                    (try (string "#{"))
-                                    (try (string "!{"))
-                                    $eol
-                                    $eof)))
-       (returnString string-trim)))
+  (>>= (getState 'insideBrackets)
+       (λ (inside)
+         (if inside
+             (>>= (many1Until (noneOf "]")
+                              (lookAhead (<any> (try (string "#["))
+                                                (try (string "#{"))
+                                                (try (string "!{"))
+                                                (char #\])
+                                                $eol
+                                                $eof)))
+                  (returnString string-trim))
+             (>>= (many1Until (<!> $eol)
+                              (lookAhead (<any> (try (string "#["))
+                                                (try (string "#{"))
+                                                (try (string "!{"))
+                                                $eol
+                                                $eof)))
+                  (returnString string-trim))))))
 
 (define escapedInterpolation
   (between (string "#{")
@@ -67,30 +89,25 @@
            (char #\})
            rightSide))
 
-
 (define tagInterpolation
   (between (string "#[")
            (char #\])
-           (>>= (many (<!> (char #\])))
-;                (returnString (compose parse-result (node null))))))
-                (λ (state)
-                  (return (parse-result (node null)
-                                        (list->string state)))))))
+           (withState (['insideBrackets #t])
+                      inLineNode)))
 
 (define textLine
-  (>> justSpaces
-      (many1Until (<or> (try escapedInterpolation)
-                        unEscapedInterpolation
-                        tagInterpolation
-                        text)
-                  (<or> $eol
-                        $eof))))
+  (many (<or> (try escapedInterpolation)
+              unEscapedInterpolation
+              tagInterpolation
+              text)))
 
 (define pipeText
-  (>> justSpaces
-      (>> (string "| ")
-          (>>= textLine
-               (compose return first)))))
+  (>> (string "| ")
+      (>>= textLine
+           (λ (txt)
+             (>> (<or> $eol
+                       $eof)
+                 (return (car txt)))))))
 
 ;; node parsers
 (define tagName
@@ -104,7 +121,7 @@
 ; foreign elements, may be written with any mix of lower- and uppercase letters that are an ASCII case-insensitive match for
 ; the attribute's name.
 
-(define attr
+(define _attribute
   (parser-compose
     (attr <- (>>= (many1 $alphaNum)
                   (returnString string->symbol)))
@@ -117,7 +134,7 @@
 (define attributes
   (between (char #\()
            (char #\))
-           (sepBy1 attr
+           (sepBy1 _attribute
                    (many (<or> (char #\space)
                                (char #\,))))))
 
@@ -165,6 +182,68 @@
 (define buffered rightSide)
 (define unEscaped rightSide)
 
+;; handling whitespace
+; indent more than parent
+(define (indentMore spaces)
+  (try (lookAhead (>> (string (list->string spaces))
+                      (many1 $space)))))
+
+(define inLineNode
+  (>>= (parser-seq tag
+                   (maybe inLineChildren))
+       (compose return
+                append*)))
+
+(define inLineChildren
+  (>>= (<any> (>> (string ": ")
+                  inLineNode)
+              (>> (char #\space)
+                  textLine))
+       (compose return list)))
+
+(define (children indent)
+  (<or> (>> (string ": ")           ; inline element is only child because
+            (>>= (_element indent)  ; following lines are children of inline
+                 (compose return    ; element
+                          list)))
+        (>>= (<or> (>> (char #\.)                ; text block is only child
+                       (>> $eol
+                           (many (parser-one (indentMore indent)
+                                             (~> textLine)
+                                             (<or> $eol
+                                                   $eof)))))
+                   (parser-seq (maybe textLine)
+                               (~ (<or> $eol
+                                        $eof))
+                               (many (>> (indentMore indent)  ; many children
+                                         (_element)))))
+             (compose return
+                      collapseStrings))))
+
+(define (node indent)
+  (parser-compose
+    (tagAtt <- tag)
+    (chldrn <- (children indent))
+    (return (append tagAtt
+                    chldrn))))
+
+(define (unBufferedComment indent)
+  (>> (string "//-")
+      (>> (children indent)
+          (return null))))
+
+(define (_comment indent)
+  (>> (string "//")
+      (>>= (parser-cons (maybe textLine)
+                        (>> $eol
+                            (many (>> (indentMore indent)
+                                      textLine))))
+           (compose return
+                    make-comment
+                    car
+                    collapseStrings))))
+
+
 ; special: mixin
 ;          case when default
 ;          if else if else unless
@@ -176,65 +255,6 @@
 ; -
 ; =
 ; !=
-
-(define (indentAtLeast spaces)
-  (try (lookAhead (>> (string (list->string spaces))
-                      (many1 $space)))))
-
-(define (children indent)
-  (<or> (>> (string ": ")                        ; inline element is only child
-            (>>= (_element indent)
-                 (compose return
-                          list)))
-        (>>= (<or> (>> (char #\.)                ; text block is only child
-                       (>> $eol
-                           (many (>> (indentAtLeast indent)
-                                     textLine))))
-                   (parser-seq (<or> (>> (char #\space)
-                                         textLine)
-                                     (>> $eol
-                                         (return null))
-                                     $eof)
-                               (many (>> (indentAtLeast indent)
-                                         (_element)))))
-             (compose return
-                      collapseStrings))))
-
-; if consecutive items in lists are strings, combine them into one string
-(define collapseStrings
-  (compose (curry foldr
-                  (match-lambda**
-                    [((? string? a)
-                      (cons (? string? b) z))
-                     (cons (string-join (list a b)) z)]
-                    [(a z) (cons a z)])
-                  null)
-           append*))
-
-
-(define (unBufferedComment indent)
-  (>> (string "//-")
-      (>> (children indent)
-          (return null))))
-
-(define (_comment indent)
-  (>> (string "//")
-      (>>= (parser-cons (<or> textLine
-                              (>> $eol
-                                  (return null)))
-                        (many (>> (indentAtLeast indent)
-                                  textLine)))
-           (compose return
-                    make-comment
-                    car
-                    collapseStrings))))
-
-(define (node indent)
-  (parser-compose
-    (tagAtt <- tag)
-    (chldrn <- (children indent))
-    (return (append tagAtt
-                    chldrn))))
 
 (define conditional
   (parser-compose
@@ -263,14 +283,14 @@
     (many1 $space)
     (var <- rightSide)
     (many1 $space)
-    (cases <- (many (parser-seq (~ (indentAtLeast indent))
+    (cases <- (many (parser-seq (~ (indentMore indent))
                                 (~ (string "when"))
                                 (~ (many1 $space))
                                 (>>= rightSide
                                      (compose return
                                               (curry equal? var)))
                                 children)))
-    (default <- (maybe (>> (indentAtLeast indent)
+    (default <- (maybe (>> (indentMore indent)
                            (>> (string "default")
                                (>> (many1 $space)
                                    (>>= children
@@ -312,6 +332,12 @@
                 case))
     (return e)))
 
+(parse textLine "this is a #[i line] of text")
+(parse tagInterpolation "#[i: strong]")
+(parse tagInterpolation "#[i #[strong  ]  ]")
+(parse tagInterpolation "#[i line]")
+;(parse textLine "this is a #[i #[strong line]] of text")
+
 (parse (_element)
 "html
   body
@@ -329,7 +355,7 @@
         span This is a span
         | and this is text after the span.
       p.
-        #[i Interesting] content, however, is 
+        #[i Very #[strong interesting]] content, however, is 
         often difficult to find.
       // This is a
          comment!
