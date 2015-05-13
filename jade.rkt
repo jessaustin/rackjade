@@ -82,12 +82,14 @@
 (define escapedInterpolation
   (between (string "#{")
            (char #\})
-           rightSide)) ; XXX escape this!
+           (withState (['insideBraces #t])
+                      rightSide))) ; XXX escape this!
 
 (define unEscapedInterpolation
   (between (string "!{")
            (char #\})
-           rightSide))
+           (withState (['insideBraces #t])
+                      rightSide)))
 
 (define tagInterpolation
   (between (string "#[")
@@ -184,9 +186,13 @@
 
 ;; handling whitespace
 ; indent more than parent
-(define (indentMore spaces)
-  (try (lookAhead (>> (string (list->string spaces))
-                      (many1 $space)))))
+(define indentMore
+  (>>= (getState 'indented)
+       (λ (spaces)
+         (if (pair? spaces)
+             (try (lookAhead (>> (string (list->string spaces))
+                                 (many1 $space))))
+             (return null)))))
 
 (define inLineNode
   (>>= (parser-seq tag
@@ -201,43 +207,47 @@
                   textLine))
        (compose return list)))
 
-(define (children indent)
-  (<or> (>> (string ": ")           ; inline element is only child because
-            (>>= (_element indent)  ; following lines are children of inline
-                 (compose return    ; element
-                          list)))
-        (>>= (<or> (>> (char #\.)                ; text block is only child
+(define children
+  (<or> (parser-compose (string ": ")      ; inline element is only child:
+                        (e <- _element)    ; any following lines are children
+                        (return (list e))) ; of inline element
+        (>>= (<or> (>> (char #\.)          ; text block is only child
                        (>> $eol
-                           (many (parser-one (indentMore indent)
+                           (many (parser-one indentMore
                                              (~> textLine)
                                              (<or> $eol
                                                    $eof)))))
                    (parser-seq (maybe textLine)
                                (~ (<or> $eol
                                         $eof))
-                               (many (>> (indentMore indent)  ; many children
-                                         (_element)))))
+                               (many (>> indentMore  ; many children
+                                         (>>= (many1 (char #\space))
+                                              (λ (spaces)
+                                                (withState (['indented spaces])
+                                                           _element)))))))
+
              (compose return
                       collapseStrings))))
 
-(define (node indent)
+(define node
   (parser-compose
     (tagAtt <- tag)
-    (chldrn <- (children indent))
+    (chldrn <- children)
     (return (append tagAtt
                     chldrn))))
 
-(define (unBufferedComment indent)
+(define unBufferedComment
   (>> (string "//-")
-      (>> (children indent)
+      (>> children
           (return null))))
 
-(define (_comment indent)
+(define _comment
   (>> (string "//")
       (>>= (parser-cons (maybe textLine)
                         (>> $eol
-                            (many (>> (indentMore indent)
-                                      textLine))))
+                            (many (parser-one indentMore
+                                              (~> textLine)
+                                              $eol))))
            (compose return
                     make-comment
                     car
@@ -283,14 +293,14 @@
     (many1 $space)
     (var <- rightSide)
     (many1 $space)
-    (cases <- (many (parser-seq (~ (indentMore indent))
+    (cases <- (many (parser-seq (~ indentMore)
                                 (~ (string "when"))
                                 (~ (many1 $space))
                                 (>>= rightSide
                                      (compose return
                                               (curry equal? var)))
                                 children)))
-    (default <- (maybe (>> (indentMore indent)
+    (default <- (maybe (>> indentMore
                            (>> (string "default")
                                (>> (many1 $space)
                                    (>>= children
@@ -317,28 +327,21 @@
     ;(many1 $space)
     ;( <- rightSide)
 
-; indent is passed in when element is on the same line with its parent and ":"
-; otherwise justSpaces figures it out
-(define (_element [indent null])
-  (parser-compose
-    (indent <- (if (pair? indent)
-                   (return indent)
-                   justSpaces))
-    (e <- (<or> pipeText               ; pipeText has no children, so no indent
-                (try (unBufferedComment indent))
-                (_comment indent)
-                (node indent)
-                conditional
-                case))
-    (return e)))
+(define _element
+  (<or> pipeText
+        (try unBufferedComment)
+        _comment
+        node
+        conditional
+        case))
 
 (parse textLine "this is a #[i line] of text")
 (parse tagInterpolation "#[i: strong]")
 (parse tagInterpolation "#[i #[strong  ]  ]")
 (parse tagInterpolation "#[i line]")
-;(parse textLine "this is a #[i #[strong line]] of text")
+(parse textLine "this is a #[i #[strong line]] of text")
 
-(parse (_element)
+(parse _element
 "html
   body
     p#first.
@@ -352,13 +355,17 @@
       p
         | Here is some content. Content
         | is great.
+        | So great that
+        | I just can't help myself.
         span This is a span
         | and this is text after the span.
       p.
         #[i Very #[strong interesting]] content, however, is 
         often difficult to find.
+        ...or even to imagine.
       // This is a
-         comment!
-         That goes on and on.
+         comment
+            That goes on and on.
       p This is a short paragraph.
-      #end")
+      #end
+")
