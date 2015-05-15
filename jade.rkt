@@ -1,18 +1,14 @@
 #lang racket
 
 (require parsack)
-(require xml)
+(require xml)      ; for make-comment: is there a better option for this?
 
 ;; convenience procs
 
 ; this one is useful enough to be included in parsack; "p" is a parser
 (define (maybe p [else null])
-  (<or> (try p)
-        (return else)))
-
-; because $spaces includes #\newline, which we never want
-(define justSpaces
-  (many (char #\space)))
+  (<any> (try p)
+         (return else)))
 
 ; parsack produces lots of lists of chars
 (define (returnString [transform identity])
@@ -24,6 +20,7 @@
 (define collapseStrings
   (compose (curry foldr
                   (match-lambda**
+                    [("" z) z]
                     [((? string? a)
                       (cons (? string? b) z))
                      (cons (string-join (list a b)) z)]
@@ -50,6 +47,12 @@
                                            #:base 16)))))
            string->list))
 
+(define blockLevels
+  (list "b" "big" "i" "small" "tt" "abbr" "acronym" "cite" "code" "dfn" "em"
+        "kbd" "strong" "samp" "var" "a" "bdo" "br" "img" "map" "object" "q"
+        "script" "span" "sub" "sup" "button" "input" "label" "select"
+        "textarea"))
+
 ; XXX this is quite incomplete
 ; it should include code exec
 (define rightSide
@@ -58,26 +61,25 @@
            (>>= (many (noneOf "\""))
                 (returnString))))
 
-;; text parsers  XXX clean up
+;; text parsers
 (define text
-  (>>= (getState 'insideBrackets)
-       (λ (inside)
-         (if inside
-             (>>= (many1Until (noneOf "]")
-                              (lookAhead (<any> (try (string "#["))
-                                                (try (string "#{"))
-                                                (try (string "!{"))
-                                                (char #\])
+  (>>= (many1 (<!> (>>= (getState 'insideBrackets)
+                        (λ (insideBrackets)
+                          (if insideBrackets
+                              (<any> (char #\])
+                                     (string "#[")
+                                     (string "#{")
+                                     (string "!{"))
+                              (>>= (getState 'insideBraces)
+                                   (λ (insideBraces)
+                                     (if insideBraces
+                                         (char #\})
+                                         (<any> (string "#[")
+                                                (string "#{")
+                                                (string "!{")
                                                 $eol
-                                                $eof)))
-                  (returnString string-trim))
-             (>>= (many1Until (<!> $eol)
-                              (lookAhead (<any> (try (string "#["))
-                                                (try (string "#{"))
-                                                (try (string "!{"))
-                                                $eol
-                                                $eof)))
-                  (returnString string-trim))))))
+                                                $eof)))))))))
+       (returnString string-trim))) ; XXX might want to trim in collapseStrings so we can save one space next to e.g. a span
 
 (define escapedInterpolation
   (between (string "#{")
@@ -98,18 +100,16 @@
                       inLineNode)))
 
 (define textLine
-  (many (<or> (try escapedInterpolation)
-              unEscapedInterpolation
-              tagInterpolation
-              text)))
+  (many1 (<or> (try escapedInterpolation)
+               unEscapedInterpolation
+               tagInterpolation
+               text)))
 
 (define pipeText
-  (>> (string "| ")
-      (>>= textLine
-           (λ (txt)
-             (>> (<or> $eol
-                       $eof)
-                 (return (car txt)))))))
+  (between (char #\|)
+           (<any> $eol
+                  $eof)
+           textLine))
 
 ;; node parsers
 (define tagName
@@ -124,21 +124,19 @@
 ; the attribute's name.
 
 (define _attribute
-  (parser-compose
-    (attr <- (>>= (many1 $alphaNum)
-                  (returnString string->symbol)))
-    (valu <- (maybe (>> (char #\=)
-                        rightSide)
-                    (symbol->string attr)))
-    (return (list attr
-                  valu))))
+  (parser-compose (attr <- (>>= (many1 $alphaNum)
+                                (returnString string->symbol)))
+                  (valu <- (maybe (>> (char #\=)
+                                      rightSide)
+                                  (symbol->string attr)))
+                  (return (list attr
+                                valu))))
 
 (define attributes
   (between (char #\()
            (char #\))
            (sepBy1 _attribute
-                   (many (<or> (char #\space)
-                               (char #\,))))))
+                   (many (oneOf " ,")))))
 
 (define andAttributes
   (between (string "&attributes(")
@@ -201,40 +199,39 @@
                 append*)))
 
 (define inLineChildren
-  (>>= (<any> (>> (string ": ")
-                  inLineNode)
-              (>> (char #\space)
-                  textLine))
-       (compose return list)))
+  (<any> (>> (string ": ")
+             inLineNode)
+         (>> (char #\space)
+             textLine)))
 
 (define children
-  (<or> (parser-compose (string ": ")      ; inline element is only child:
-                        (e <- _element)    ; any following lines are children
-                        (return (list e))) ; of inline element
-        (>>= (<or> (>> (char #\.)          ; text block is only child
-                       (>> $eol
-                           (many (parser-one indentMore
-                                             (~> textLine)
-                                             (<or> $eol
-                                                   $eof)))))
-                   (parser-seq (maybe textLine)
-                               (~ (<or> $eol
-                                        $eof))
-                               (many (>> indentMore  ; many children
-                                         (>>= (many1 (char #\space))
-                                              (λ (spaces)
-                                                (withState (['indented spaces])
-                                                           _element)))))))
-
-             (compose return
-                      collapseStrings))))
+  (<any> (parser-one (string ": ")  ; inline element is only child: any
+                     (~> _element)) ; following lines are children of text
+         (>>= (<any> (>> (char #\.) ; block is only child
+                         (>> $eol
+                             (many (parser-one indentMore
+                                               (~> textLine)
+                                               (<any> $eol
+                                                      $eof)))))
+                     (parser-seq (maybe textLine)
+                                 (~ (<any> $eol
+                                           $eof))
+                                 (>>= (many (>> indentMore  ; many children
+                                                (>>= (many1 (char #\space))
+                                                     (λ (spaces)
+                                                       (withState (['indented spaces])
+                                                                  _element)))))
+                                      (compose return
+                                               append*))))
+              (compose return
+                       collapseStrings))))
 
 (define node
-  (parser-compose
-    (tagAtt <- tag)
-    (chldrn <- children)
-    (return (append tagAtt
-                    chldrn))))
+  (>>= (parser-seq tag
+                   children)
+       (compose return
+                list
+                append*)))
 
 (define unBufferedComment
   (>> (string "//-")
@@ -243,16 +240,22 @@
 
 (define _comment
   (>> (string "//")
-      (>>= (parser-cons (maybe textLine)
-                        (>> $eol
-                            (many (parser-one indentMore
-                                              (~> textLine)
-                                              $eol))))
+      (>>= (parser-seq (>>= (many (<!> $eol))
+                            (compose return
+                                     list->string))
+                       (>> $eol
+                           (>>= (many (parser-one indentMore
+                                                  (many (char #\space))
+                                                  (~> (many (<!> $eol)))
+                                                  $eol))
+                                (compose return
+                                         string-join
+                                         (curry map
+                                                list->string)))))
            (compose return
+                    list
                     make-comment
-                    car
-                    collapseStrings))))
-
+                    string-join))))
 
 ; special: mixin
 ;          case when default
@@ -266,80 +269,11 @@
 ; =
 ; !=
 
-(define conditional
-  (parser-compose
-    (indent <- justSpaces)
-    (string "if")
-    (many1 $space)
-    (cond <- (parser-seq rightSide
-                         children))
-    (conds <- (many (>> (string "else if")
-                        (>> (many1 $space)
-                            (parser-seq rightSide
-                                        children)))))
-    (else <- (maybe (>> (string "else")
-                        (>> (many1 $space)
-                            (parser-seq rightSide
-                                        children)))))
-    (return (cadr (assf identity
-                        (cons cond
-                              (append conds
-                                      else)))))))
-
-(define case
-  (parser-compose
-    (indent <- justSpaces)
-    (string "case")
-    (many1 $space)
-    (var <- rightSide)
-    (many1 $space)
-    (cases <- (many (parser-seq (~ indentMore)
-                                (~ (string "when"))
-                                (~ (many1 $space))
-                                (>>= rightSide
-                                     (compose return
-                                              (curry equal? var)))
-                                children)))
-    (default <- (maybe (>> indentMore
-                           (>> (string "default")
-                               (>> (many1 $space)
-                                   (>>= children
-                                        (compose return
-                                                 (curry list #t))))))))
-    (return (cadr (assf identity
-                        (append cases
-                                default))))))
-
-;(define each
- ; (parser-compose
-  ;  (indent <- justSpaces)
-   ; (<or> (string "each")
-    ;      (string "for"))
-;    (many1 $space)
- ;   (lst <- rightSide)
-  ;  (return (map ()
-   ;              lst))))
-
-;(define while
- ;   (parser-compose
-  ;  (indent <- justSpaces)
-   ; (string "while")
-    ;(many1 $space)
-    ;( <- rightSide)
-
 (define _element
-  (<or> pipeText
-        (try unBufferedComment)
-        _comment
-        node
-        conditional
-        case))
-
-(parse textLine "this is a #[i line] of text")
-(parse tagInterpolation "#[i: strong]")
-(parse tagInterpolation "#[i #[strong  ]  ]")
-(parse tagInterpolation "#[i line]")
-(parse textLine "this is a #[i #[strong line]] of text")
+  (<any> pipeText
+         (try unBufferedComment)
+         _comment
+         node))
 
 (parse _element
 "html
@@ -352,20 +286,30 @@
         li
           a(href=\"two.html\") Two
     #main.content
-      p
-        | Here is some content. Content
+      p #[strong What] about content?
+        | #[i Here] is some content. Content
         | is great.
         | So great that
         | I just can't help myself.
         span This is a span
         | and this is text after the span.
       p.
+        What
+        about #[i this] content?
+      p.
         #[i Very #[strong interesting]] content, however, is 
         often difficult to find.
         ...or even to imagine.
-      // This is a
-         comment
-            That goes on and on.
-      p This is a short paragraph.
-      #end
-")
+      // now...
+        how about some comments?
+      // here's
+         another
+         comment, but there's a
+         #[i problem] here
+      p
+        | One
+        span lonely span
+        | and another,
+        span not-so-lonely, span
+      p #[strong This] is a short paragraph.
+      #end")
