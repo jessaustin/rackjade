@@ -47,7 +47,7 @@
                                            #:base 16)))))
            string->list))
 
-(define blockLevels
+(define inLineLevels
   (list "b" "big" "i" "small" "tt" "abbr" "acronym" "cite" "code" "dfn" "em"
         "kbd" "strong" "samp" "var" "a" "bdo" "br" "img" "map" "object" "q"
         "script" "span" "sub" "sup" "button" "input" "label" "select"
@@ -79,7 +79,7 @@
                                                 (string "!{")
                                                 $eol
                                                 $eof)))))))))
-       (returnString string-trim))) ; XXX might want to trim in collapseStrings so we can save one space next to e.g. a span
+       (returnString))) ; XXX might want to trim in collapseStrings so we can save one space next to e.g. a span
 
 (define escapedInterpolation
   (between (string "#{")
@@ -106,7 +106,8 @@
                text)))
 
 (define pipeText
-  (between (char #\|)
+  (between (>> (char #\|)
+               (maybe (char #\space)))
            (<any> $eol
                   $eof)
            textLine))
@@ -210,10 +211,12 @@
          (>>= (<any> (>> (char #\.) ; block is only child
                          (>> $eol
                              (many (parser-one indentMore
+                                               (many (char #\space))
                                                (~> textLine)
                                                (<any> $eol
                                                       $eof)))))
-                     (parser-seq (maybe textLine)
+                     (parser-seq (maybe (>> (char #\space)
+                                            textLine))
                                  (~ (<any> $eol
                                            $eof))
                                  (>>= (many (>> indentMore  ; many children
