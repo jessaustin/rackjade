@@ -80,22 +80,20 @@
                       inLineNode)))
 
 (define text
-  (>>= (many1 (<!> (>>= (getState 'insideBrackets)
-                        (λ (insideBrackets)
-                          (if insideBrackets
-                              (<any> (char #\])
-                                     (string "#[")
-                                     (string "#{")
-                                     (string "!{"))
-                              (>>= (getState 'insideBraces)
-                                   (λ (insideBraces)
-                                     (if insideBraces
-                                         (char #\})
-                                         (<any> (string "#[")
-                                                (string "#{")
-                                                (string "!{")
-                                                $eol
-                                                $eof)))))))))
+  (>>= (many1 (<!> (>>= (getState 'insideBraces)
+                        (λ (insideBraces)
+                          (if insideBraces
+                              (char #\})
+                              (>>= (getState 'insideBrackets)
+                                   (λ (insideBrackets)
+                                     (apply <any>
+                                            (append `(,(string "#[")
+                                                      ,(string "#{")
+                                                      ,(string "!{"))
+                                                    (if insideBrackets
+                                                        `(,(char #\]))
+                                                        `(,$eol
+                                                          ,$eof)))))))))))
        (returnString)))
 
 (define textLine
