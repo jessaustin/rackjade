@@ -23,7 +23,7 @@
                     [("" z) z]
                     [((? string? a)
                       (cons (? string? b) z))
-                     (cons (string-join (list a b)) z)]
+                     (cons (string-join `(,a ,b)) z)]
                     [(a z) (cons a z)])
                   null)
            append*))
@@ -48,10 +48,9 @@
            string->list))
 
 (define inLineLevels
-  (list "b" "big" "i" "small" "tt" "abbr" "acronym" "cite" "code" "dfn" "em"
-        "kbd" "strong" "samp" "var" "a" "bdo" "br" "img" "map" "object" "q"
-        "script" "span" "sub" "sup" "button" "input" "label" "select"
-        "textarea"))
+  '("b" "big" "i" "small" "tt" "abbr" "acronym" "cite" "code" "dfn" "em" "kbd"
+    "strong" "samp" "var" "a" "bdo" "br" "img" "map" "object" "q" "script"
+    "span" "sub" "sup" "button" "input" "label" "select" "textarea"))
 
 ; XXX this is quite incomplete
 ; it should include code exec
@@ -61,26 +60,7 @@
            (>>= (many (noneOf "\""))
                 (returnString))))
 
-;; text parsers
-(define text
-  (>>= (many1 (<!> (>>= (getState 'insideBrackets)
-                        (λ (insideBrackets)
-                          (if insideBrackets
-                              (<any> (char #\])
-                                     (string "#[")
-                                     (string "#{")
-                                     (string "!{"))
-                              (>>= (getState 'insideBraces)
-                                   (λ (insideBraces)
-                                     (if insideBraces
-                                         (char #\})
-                                         (<any> (string "#[")
-                                                (string "#{")
-                                                (string "!{")
-                                                $eol
-                                                $eof)))))))))
-       (returnString))) ; XXX might want to trim in collapseStrings so we can save one space next to e.g. a span
-
+;; text parsing
 (define escapedInterpolation
   (between (string "#{")
            (char #\})
@@ -98,6 +78,25 @@
            (char #\])
            (withState (['insideBrackets #t])
                       inLineNode)))
+
+(define text
+  (>>= (many1 (<!> (>>= (getState 'insideBrackets)
+                        (λ (insideBrackets)
+                          (if insideBrackets
+                              (<any> (char #\])
+                                     (string "#[")
+                                     (string "#{")
+                                     (string "!{"))
+                              (>>= (getState 'insideBraces)
+                                   (λ (insideBraces)
+                                     (if insideBraces
+                                         (char #\})
+                                         (<any> (string "#[")
+                                                (string "#{")
+                                                (string "!{")
+                                                $eol
+                                                $eof)))))))))
+       (returnString)))
 
 (define textLine
   (many1 (<or> (try escapedInterpolation)
@@ -118,26 +117,26 @@
               (returnString string->symbol))
          'div))  ; clever!
 
-; Attributes have a name and a value. Attribute names must consist of one or more characters other than the space characters,
-; U+0000 NULL, U+0022 QUOTATION MARK ("), U+0027 APOSTROPHE ('), ">" (U+003E), "/" (U+002F), and "=" (U+003D) characters, the
-; control characters, and any characters that are not defined by Unicode. In the HTML syntax, attribute names, even those for
-; foreign elements, may be written with any mix of lower- and uppercase letters that are an ASCII case-insensitive match for
-; the attribute's name.
-
+; attribute names can contain funny characters
 (define _attribute
-  (parser-compose (attr <- (>>= (many1 $alphaNum)
+  (parser-compose (attr <- (>>= (many1 (<!> (<any> $space
+                                                   (satisfy char-iso-control?)
+                                                   (char #\")
+                                                   (char #\')
+                                                   (char #\/)
+                                                   (char #\>)
+                                                   (char #\=))))
                                 (returnString string->symbol)))
-                  (valu <- (maybe (>> (char #\=)
-                                      rightSide)
-                                  (symbol->string attr)))
-                  (return (list attr
-                                valu))))
+                  (value <- (maybe (>> (char #\=)
+                                       rightSide)
+                                   (symbol->string attr)))
+                  (return `(,attr ,value))))
 
 (define attributes
   (between (char #\()
            (char #\))
            (sepBy1 _attribute
-                   (many (oneOf " ,")))))
+                   (many1 (oneOf " ,")))))
 
 (define andAttributes
   (between (string "&attributes(")
@@ -170,15 +169,13 @@
                                                   first)
                                          attrs)]
                     [(classes) (map second (append c1 c2 cA))])
-        (list tn
-              (append (if (null? id)
-                          id
-                          (list id))
-                      (if (null? classes)
-                          classes
-                          (list (list 'class
-                                      (string-join classes))))
-                      etc))))))
+        `(,tn ,(append (if (null? id)
+                           id
+                           `(,id))
+                       (if (null? classes)
+                           classes
+                           `(('class ,(string-join classes))))
+                       etc))))))
 
 (define buffered rightSide)
 (define unEscaped rightSide)
@@ -222,8 +219,9 @@
                                  (>>= (many (>> indentMore  ; many children
                                                 (>>= (many1 (char #\space))
                                                      (λ (spaces)
-                                                       (withState (['indented spaces])
-                                                                  _element)))))
+                                                       (withState
+                                                         (['indented spaces])
+                                                         _element)))))
                                       (compose return
                                                append*))))
               (compose return
@@ -311,7 +309,7 @@
          #[i problem] here
       p
         | One
-        span lonely span
+        span(weirdA$$-attr=\"yo\") lonely span
         | and another,
         span not-so-lonely, span
       p #[strong This] is a short paragraph.
