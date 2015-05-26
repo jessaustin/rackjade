@@ -48,49 +48,61 @@
            string->list))
 
 (define inLineLevels
-  '("b" "big" "i" "small" "tt" "abbr" "acronym" "cite" "code" "dfn" "em" "kbd"
-    "strong" "samp" "var" "a" "bdo" "br" "img" "map" "object" "q" "script"
-    "span" "sub" "sup" "button" "input" "label" "select" "textarea"))
+  '(a abbr acronym b bdo big br button cite code dfn em i img input kbd label
+    map object q samp script select small span strong sub sup textarea tt var))
 
-; XXX this is quite incomplete
-; it should include code exec
 (define rightSide
-  (between (char #\")
-           (char #\")
-           (>>= (many (noneOf "\""))
-                (returnString))))
+  (>>= (many1 (<!> (<any> (char #\}) ; maybe this should only be inBraces?
+                          $eol
+                          $eof)))
+       (λ (code)
+         (current-namespace (make-base-namespace))
+         (let ([x (eval (list->string code))])
+           (print x)
+           (return x)))))
+
+(define attrRightSide
+  (>>= (<any> (between (char #\()
+                       (char #\))
+                       (many (<!> (char #\)))))
+              (many1 (<!> (<any> (char #\space)
+                                       $eol
+                                       $eof))))
+       (λ (code)
+         (return (eval (list->string code)
+                       )))))
 
 ;; text parsing
 (define escapedInterpolation
   (between (string "#{")
            (char #\})
-           (withState (['insideBraces #t])
+           (withState (['inBraces #t])
                       rightSide))) ; XXX escape this!
 
 (define unEscapedInterpolation
   (between (string "!{")
            (char #\})
-           (withState (['insideBraces #t])
+           (withState (['inBraces #t])
                       rightSide)))
 
 (define tagInterpolation
   (between (string "#[")
            (char #\])
-           (withState (['insideBrackets #t])
+           (withState (['inBrackets #t])
                       inLineNode)))
 
 (define text
-  (>>= (many1 (<!> (>>= (getState 'insideBraces)
-                        (λ (insideBraces)
-                          (if insideBraces
+  (>>= (many1 (<!> (>>= (getState 'inBraces)
+                        (λ (inBraces)
+                          (if inBraces
                               (char #\})
-                              (>>= (getState 'insideBrackets)
-                                   (λ (insideBrackets)
+                              (>>= (getState 'inBrackets)
+                                   (λ (inBrackets)
                                      (apply <any>
                                             (append `(,(string "#[")
                                                       ,(string "#{")
                                                       ,(string "!{"))
-                                                    (if insideBrackets
+                                                    (if inBrackets
                                                         `(,(char #\]))
                                                         `(,$eol
                                                           ,$eof)))))))))))
@@ -109,6 +121,13 @@
                   $eof)
            textLine))
 
+(define hyphenLine
+  (>> (between (char #\-)
+               (<any> $eol
+                      $eof)
+               rightSide)
+      (return null)))
+
 ;; node parsers
 (define tagName
   (maybe (>>= (many1 $alphaNum)
@@ -126,7 +145,7 @@
                                                    (char #\=))))
                                 (returnString string->symbol)))
                   (value <- (maybe (>> (char #\=)
-                                       rightSide)
+                                       attrRightSide) ; XXX this might need more
                                    (symbol->string attr)))
                   (return `(,attr ,value))))
 
@@ -270,17 +289,19 @@
 
 (define _element
   (<any> pipeText
+         hyphenLine
          (try unBufferedComment)
          _comment
          node))
 
 (parse _element
 "html
+  - (define x \"yolo\")
   body
     p#first.
       This is an introductory paragraph.
     #nav.nav
-      ol
+      // ol
         li: a(href=\"one.html\") One
         li
           a(href=\"two.html\") Two
@@ -307,7 +328,7 @@
          #[i problem] here
       p
         | One
-        span(weirdA$$-attr=\"yo\") lonely span
+        //span(weirdA$$-attr=\"yo\") lonely span
         | and another,
         span not-so-lonely, span
       p #[strong This] is a short paragraph.
